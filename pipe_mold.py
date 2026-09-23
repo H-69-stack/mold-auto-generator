@@ -631,20 +631,43 @@ def offset_wire_outward(wire, delta: float):
 
 
 def _wire_center(wire):
-    """wire 顶点平均位置（近似孔口中心）。"""
+    """wire 的**形心**（沿曲线积分求质心）。
+
+    注意：**不能用顶点平均**。BSpline 环上顶点很少而且分布极不均匀（一个环可能只有 2 个
+    BSpline 边、3 个顶点，其中一个顶点可能落在环的一侧极值处），顶点平均会偏出几十毫米，
+    于是"内孔中心"错了 → 端口平面的**局部轴向**跟着错 → 轴向射线打到顶面之类的横向面 →
+    端口平面被拟合成一个水平面 → 截断会把整块模芯横着切掉一半，切出来的"芯棒"变成一大块
+    顶板（实测 `24TK_1442-1` 就是这样：芯棒 1 444 401 mm³、765×93×22 的一块板）。
+    """
+    try:
+        props = GProp_GProps()
+        BRepGProp.LinearProperties_s(wire, props)
+        c = props.CentreOfMass()
+        if np.isfinite(c.X()) and np.isfinite(c.Y()) and np.isfinite(c.Z()):
+            return (c.X(), c.Y(), c.Z())
+    except Exception:  # noqa: BLE001
+        pass
+    # 兜底：把每条边离散化后求平均（比只用顶点稳）
     pts = []
-    exp = TopExp_Explorer(wire, TopAbs_VERTEX)
+    exp = TopExp_Explorer(wire, TopAbs_EDGE)
     while exp.More():
-        try:
-            pts.append(BRep_Tool.Pnt_s(TopoDS.Vertex_s(exp.Current())))
-        except Exception:  # noqa: BLE001
-            pass
+        e = TopoDS.Edge_s(exp.Current())
         exp.Next()
+        try:
+            ca = BRepAdaptor_Curve(e)
+            u0, u1 = ca.FirstParameter(), ca.LastParameter()
+            if not np.isfinite(u0) or not np.isfinite(u1):
+                continue
+            for t in np.linspace(u0, u1, 17):
+                q = ca.Value(t)
+                pts.append((q.X(), q.Y(), q.Z()))
+        except Exception:  # noqa: BLE001
+            continue
     if not pts:
         return None
-    return (sum(p.X() for p in pts) / len(pts),
-            sum(p.Y() for p in pts) / len(pts),
-            sum(p.Z() for p in pts) / len(pts))
+    n = float(len(pts))
+    return (sum(p[0] for p in pts) / n, sum(p[1] for p in pts) / n,
+            sum(p[2] for p in pts) / n)
 
 
 def _is_open_hole(shape, wire, face_normal, probe: float = 0.6):
@@ -992,33 +1015,46 @@ def port_cut_planes(shape, axis: int, pts=None, verbose: bool = False):
             _say("端%+d 从管壁 %s 沿轴向 %s 打射线无命中" %
                  (end, np.round(m, 2), np.round(d, 3)))
             return None
-        _t_hit, p_hit, face_hit = axial[0]
-        p = np.array([p_hit.X(), p_hit.Y(), p_hit.Z()])
+        # 逐个命中面里挑**真正的端口端面**：必须是平面、法向基本沿着长轴（斜切端口允许
+        # 偏几十度），并且是"支持平面"（材料都在法向内侧）。这一条很关键：局部轴一旦算歪，
+        # 射线可能打到产品的上表面/侧面，那种横向面绝不能当端口面 —— 拿它去截断会把整块
+        # 模芯横着切开，切出来的"芯棒"会是一大块顶板（实测 24TK_1442-1 的故障）。
+        p = None
         n = None
-        try:
-            n = _face_normal(TopoDS.Face_s(face_hit))
-        except Exception:  # noqa: BLE001
-            n = None
-        if n is None:
-            n = d
-        n = np.asarray(n, dtype=float)
-        n = n / max(float(np.linalg.norm(n)), 1e-12)
-        if float(n @ d) < 0.0:               # 与朝外方向相反就翻过来
-            n = -n
-        # 必须是"支持平面"：材料基本都在法向内侧（否则射线打到的不是端口面）。
-        # 容差给 1 mm：面的 (u,v) 参数矩形包含被裁掉的区域，采样点可能落到真实几何之外
-        # （本件实测 0.30 mm）—— 那只是采样虚高，端口平面本身仍是精确的；
-        # 而打错面（例如打到外圆柱面）时外伸会是几十毫米，照样会被否掉。
-        over = float(((P - p) @ n).max())
-        if over > 1.0:
-            over2 = float(((P - p) @ d).max())
-            _say("端%+d 命中面 %.2f 不是支持平面（外伸 %.2f，按轴向 %.2f）"
-                 % (end, np.array([p_hit.X(), p_hit.Y(), p_hit.Z()])[axis], over, over2))
-            if over2 > 1.0:
-                return None
-            n = d
-            p = p.copy()
-            over = over2
+        over = None
+        for _t_hit, p_hit, face_hit in axial[:8]:
+            p_try = np.array([p_hit.X(), p_hit.Y(), p_hit.Z()])
+            try:
+                n_try = _face_normal(TopoDS.Face_s(face_hit))
+            except Exception:  # noqa: BLE001
+                n_try = None
+            if n_try is None:
+                n_try = d
+            n_try = np.asarray(n_try, dtype=float)
+            n_try = n_try / max(float(np.linalg.norm(n_try)), 1e-12)
+            if float(n_try @ d) < 0.0:             # 与朝外方向相反就翻过来
+                n_try = -n_try
+            if float(n_try @ d) < 0.6:             # 横向面（顶面/侧面）→ 不是端口端面
+                _say("端%+d 命中面法向 %s 与长轴夹角太大（%.1f°），不是端口端面，继续找"
+                     % (end, np.round(n_try, 3),
+                        np.degrees(np.arccos(min(1.0, abs(float(n_try @ d)))))))
+                continue
+            over_try = float(((P - p_try) @ n_try).max())
+            if over_try > 1.0:
+                # 容差给 1 mm：面的 (u,v) 参数矩形包含被裁掉的区域，采样点可能落到真实几何
+                # 之外（本件实测 0.30 mm）—— 那只是采样虚高；而打错面时外伸是几十毫米。
+                over2 = float(((P - p_try) @ d).max())
+                _say("端%+d 命中面 %.2f 不是支持平面（外伸 %.2f，按轴向 %.2f）"
+                     % (end, p_try[axis], over_try, over2))
+                if over2 > 1.0:
+                    continue
+                n_try = d
+                over_try = over2
+            p, n, over = p_try, n_try, over_try
+            break
+        if p is None:
+            _say("端%+d 沿轴向打射线没命中合适的端口端面" % end)
+            return None
         if verbose:
             print("    · 端%+d: 截面 %.2f 内孔中心 %s → 端口面点 %s 法向 %s（外伸 %.3f）"
                   % (end, a_s, np.round(c, 1), np.round(p, 2), np.round(n, 3), over),
@@ -1806,6 +1842,21 @@ def trim_core_and_hull(block, product, axis: Optional[int] = None, pts=None,
         c = max(others, key=shape_volume)
         if shape_volume(c) <= 1e-6:
             info["reason"] = "芯棒体积为 0"
+            return None
+        # 芯棒必须**落在产品包围盒里**（内孔腔本来就在产品内部）。截断面拟合错了时
+        # （例如把产品顶面当成端口面），切出来的可能是模芯的一大块顶板 —— 这种必须拒掉，
+        # 好让主流程换下一种截断方式（实测 `24TK_1442-1` 的"芯棒"就是一块 765×93×22 的顶板）。
+        cb = shape_bbox(c)
+        pb = shape_bbox(product)
+        tol = max(3.0, 0.01 * max(pb[3] - pb[0], pb[4] - pb[1], pb[5] - pb[2]))
+        over = max(max(pb[i] - cb[i], cb[i + 3] - pb[i + 3]) for i in range(3))
+        if over > tol:
+            info["reason"] = ("%s 切出来的块超出产品包围盒 %.2f mm"
+                              "（截断面没落在端口端面上）" % (tag, over))
+            if verbose:
+                print("    · [提示] %s 切出的块 %.1f×%.1f×%.1f 超出产品包围盒 %.2f mm"
+                      "（> %.2f），判为截断面不对，换下一种截断方式"
+                      % (tag, cb[3] - cb[0], cb[4] - cb[1], cb[5] - cb[2], over, tol))
             return None
         info["trim"] = tag
         info["planes"] = {"管壁端面截断": "wall_end", "端口盖片": "port_slab",
