@@ -33,7 +33,7 @@ from OCP.BRep import BRep_Builder, BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
 from OCP.BRepBuilderAPI import (BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakePolygon,
-                                BRepBuilderAPI_Transform)
+                                BRepBuilderAPI_MakeWire, BRepBuilderAPI_Transform)
 from OCP.BRepClass3d import BRepClass3d_SolidClassifier
 from OCP.BRepGProp import BRepGProp
 from OCP.BRepLProp import BRepLProp_SLProps
@@ -43,7 +43,7 @@ from OCP.GProp import GProp_GProps
 from OCP.GeomAbs import GeomAbs_Plane
 from OCP.TopAbs import (TopAbs_EDGE, TopAbs_FACE, TopAbs_IN, TopAbs_ON, TopAbs_OUT,
                         TopAbs_REVERSED, TopAbs_SOLID, TopAbs_VERTEX, TopAbs_WIRE)
-from OCP.TopExp import TopExp_Explorer
+from OCP.TopExp import TopExp, TopExp_Explorer
 from OCP.TopoDS import TopoDS, TopoDS_Compound
 from OCP.gp import gp_Dir, gp_Lin, gp_Pnt, gp_Trsf, gp_Vec
 
@@ -545,6 +545,72 @@ AXIS_VEC = {0: (1.0, 0.0, 0.0), 1: (0.0, 1.0, 0.0)}
 AXIS_NAME = {0: "x", 1: "y"}
 
 
+def _edge_endpoints(edge):
+    """返回边端点 ((x1,y1,z1),(x2,y2,z2))。"""
+    vf = TopoDS.Vertex_s(TopExp.FirstVertex_s(edge))
+    vl = TopoDS.Vertex_s(TopExp.LastVertex_s(edge))
+    p1 = BRep_Tool.Pnt_s(vf)
+    p2 = BRep_Tool.Pnt_s(vl)
+    return (p1.X(), p1.Y(), p1.Z()), (p2.X(), p2.Y(), p2.Z())
+
+
+def _pt_dist(a, b):
+    return float(np.linalg.norm(np.asarray(a, dtype=float) - np.asarray(b, dtype=float)))
+
+
+def _assemble_wires(edges, tol: float = 1e-5):
+    """贪心端点匹配，把截面边组装成闭合 wire。
+
+    截面边的顶点可能不完全重合（容差问题），且顺序随机；
+    BRepBuilderAPI_MakeWire / ShapeAnalysis_FreeBounds 在这种情况下不可靠，
+    这里按端点距离贪心连接，返回 TopoDS_Wire 列表。
+
+    （原在 `parting_splitter.py` 里；本系统精简为只管件后把那套板件管线删掉了，
+    这个唯一被管件管线用到的工具函数就搬到这里，避免多一个模块依赖。）
+    """
+    eps = [_edge_endpoints(e) for e in edges]
+    used = [False] * len(edges)
+    wires = []
+    for i in range(len(edges)):
+        if used[i]:
+            continue
+        used[i] = True
+        chain = [i]
+        head = eps[i][0]
+        tail = eps[i][1]
+        closed = _pt_dist(head, tail) <= tol
+        progressed = True
+        while not closed and progressed:
+            progressed = False
+            for j in range(len(edges)):
+                if used[j]:
+                    continue
+                s, e_ = eps[j]
+                if _pt_dist(s, tail) <= tol:
+                    chain.append(j)
+                    used[j] = True
+                    tail = e_
+                    progressed = True
+                elif _pt_dist(e_, tail) <= tol:
+                    chain.append(j)
+                    used[j] = True
+                    tail = s
+                    progressed = True
+                if progressed:
+                    break
+            closed = _pt_dist(head, tail) <= tol
+        if len(chain) >= 1 and closed:
+            mw = BRepBuilderAPI_MakeWire()
+            for idx in chain:
+                try:
+                    mw.Add(edges[idx])
+                except Exception:  # noqa: BLE001
+                    pass
+            if mw.IsDone() and not mw.Shape().IsNull():
+                wires.append(TopoDS.Wire_s(mw.Shape()))
+    return wires
+
+
 def section_wires_plane(shape, origin, normal, tol: float = 1e-4):
     """求 shape 与**任意平面**（过 origin、法向 normal）的交线，组装成闭合 wire。
 
@@ -552,7 +618,6 @@ def section_wires_plane(shape, origin, normal, tol: float = 1e-4):
     """
     from OCP.BRepAlgoAPI import BRepAlgoAPI_Section
     from OCP.gp import gp_Dir as _D, gp_Pln as _P
-    from parting_splitter import _assemble_wires
     from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace as _MF
 
     pln = _P(gp_Pnt(float(origin[0]), float(origin[1]), float(origin[2])),
@@ -1179,8 +1244,6 @@ def _port_rim_from_face(face, axis_pt, axis_dir):
     做法：把端面的边**整体组装成环**（一般是外轮廓 + 内孔口两圈），取"围成面积小"的那圈
     = 内孔开口。不能按"中点到轴线的距离"挑边：斜切口的半径沿环变化，挑出来的边不闭合。
     """
-    from parting_splitter import _assemble_wires
-
     edges = []
     try:
         exp = TopExp_Explorer(face, TopAbs_EDGE)

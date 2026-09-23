@@ -1,12 +1,17 @@
-# 管件硬模成型模具生成（mold_type = "pipe"）
+# 管件硬模成型模具生成（管件管线）
+
+> **本系统已精简为只管件硬模成型**：板件折弯管线、旧版修复器、独立芯棒设计模块
+> （`core_design.py` / `main.py --mode core`）与三维查看（three.js）已从仓库移除
+> （本机留在 `_legacy/`，历史版本仍在 git 里）。因此本文里提到的
+> `parting_splitter` / `CORE_DESIGN_README.md` / `--mode core` 只作历史记录，
+> 当前代码路径是：`main.generate_mold()` → `pipe_mold.build_pipe_mold()`。
+> `pipe_mold` 唯一用到板件管线的工具函数 `_assemble_wires` 已内联进 `pipe_mold.py`。
 
 > 针对**薄壁中空管件**（如 `24TK_1324-1`：D 形截面、壁厚 2 mm、长 757 mm、
 > 末端上翘的弯管）的模具生成逻辑与问题定位记录。
 
-> 相关模块：**模芯设计（芯棒 / 内芯）** 见 [`CORE_DESIGN_README.md`](CORE_DESIGN_README.md) ——
-> 模具管的是产品**外形**（内孔被填实成包络），芯棒管的是产品**内孔**（沿两端端口面填满）。
-> **管件模式默认就在同一次布尔里把芯棒一起切出来**，直接给出四件套装配体；
-> 要"端面严格齐平 / 带装配间隙 / 逐站位校验"的正式芯棒图时，用 `main.py --mode core`。
+> **芯棒**：管件模式默认就在同一次布尔里把芯棒一起切出来，直接给出四件套装配体
+> （`{编号}_core_pin.step` + `{编号}_mold4_assembly.step`）。
 
 ---
 

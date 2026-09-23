@@ -1,0 +1,29 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# ---------- 运行产物 / 缓存 / 上传目录（体积大，勿上传）----------
+output/
+fix_output/
+mold_output/
+mold_fix_cache/
+_pipe_diag/
+_repro3_fixed/
+_legacy/
+_github_upload/
+_github_repo/
+web_box_generator/uploads/
+*.log
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---------- 大型 CAD 数据（默认上传；想排除就把下面三行取消注释）----------
+# *.stp
+# *.step
+# *.stl
